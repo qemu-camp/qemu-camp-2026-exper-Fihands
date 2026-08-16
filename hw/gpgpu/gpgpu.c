@@ -31,18 +31,32 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
     case GPGPU_REG_DEV_VERSION:  return GPGPU_DEV_VERSION_VALUE;
     case GPGPU_REG_VRAM_SIZE_LO: return (uint32_t)(s->vram_size);
     case GPGPU_REG_VRAM_SIZE_HI: return (uint32_t)(s->vram_size >> 32);
+    case GPGPU_REG_GLOBAL_CTRL:  return s->global_ctrl;
+    case GPGPU_REG_GLOBAL_STATUS: return s->global_status;
     default:                     return 0;
     }
     (void)size;
 }
 
-/* TODO: Implement MMIO control register write */
+/* MMIO control register write */
 static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
+    GPGPUState *s = opaque;
+
+    switch (addr) {
+    case GPGPU_REG_GLOBAL_CTRL:
+        /* 仅保留定义过的控制位 */
+        s->global_ctrl = val & (GPGPU_CTRL_ENABLE | GPGPU_CTRL_RESET);
+        if (val & GPGPU_CTRL_RESET) {
+            /* 触发设备软复位，并自动清除复位位 */
+            device_cold_reset(DEVICE(s));
+            s->global_ctrl &= ~GPGPU_CTRL_RESET;
+        }
+        break;
+    default:
+        break;
+    }
     (void)size;
 }
 
