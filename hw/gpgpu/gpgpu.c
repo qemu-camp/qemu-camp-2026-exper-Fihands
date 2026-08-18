@@ -31,8 +31,12 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
     case GPGPU_REG_DEV_VERSION:  return GPGPU_DEV_VERSION_VALUE;
     case GPGPU_REG_VRAM_SIZE_LO: return (uint32_t)(s->vram_size);
     case GPGPU_REG_VRAM_SIZE_HI: return (uint32_t)(s->vram_size >> 32);
+    case GPGPU_REG_DEV_CAPS:     return 0;
     case GPGPU_REG_GLOBAL_CTRL:  return s->global_ctrl;
     case GPGPU_REG_GLOBAL_STATUS: return s->global_status;
+    case GPGPU_REG_ERROR_STATUS: return s->error_status;
+    case GPGPU_REG_IRQ_ENABLE:   return s->irq_enable;
+    case GPGPU_REG_IRQ_STATUS:   return s->irq_status;
     case GPGPU_REG_KERNEL_ADDR_LO:  return (uint32_t)s->kernel.kernel_addr;
     case GPGPU_REG_KERNEL_ADDR_HI:  return (uint32_t)(s->kernel.kernel_addr >> 32);
     case GPGPU_REG_KERNEL_ARGS_LO:  return (uint32_t)s->kernel.kernel_args;
@@ -43,6 +47,13 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
     case GPGPU_REG_BLOCK_DIM_X:  return s->kernel.block_dim[0];
     case GPGPU_REG_BLOCK_DIM_Y:  return s->kernel.block_dim[1];
     case GPGPU_REG_BLOCK_DIM_Z:  return s->kernel.block_dim[2];
+    case GPGPU_REG_DMA_SRC_LO:   return (uint32_t)s->dma.src_addr;
+    case GPGPU_REG_DMA_SRC_HI:   return (uint32_t)(s->dma.src_addr >> 32);
+    case GPGPU_REG_DMA_DST_LO:   return (uint32_t)s->dma.dst_addr;
+    case GPGPU_REG_DMA_DST_HI:   return (uint32_t)(s->dma.dst_addr >> 32);
+    case GPGPU_REG_DMA_SIZE:     return s->dma.size;
+    case GPGPU_REG_DMA_CTRL:     return s->dma.ctrl;
+    case GPGPU_REG_DMA_STATUS:   return s->dma.status;
     default:                     return 0;
     }
     (void)size;
@@ -64,6 +75,17 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             s->global_ctrl &= ~GPGPU_CTRL_RESET;
         }
         break;
+    case GPGPU_REG_ERROR_STATUS:
+        /* 写 1 清除对应错误位 */
+        s->error_status &= ~val;
+        break;
+    case GPGPU_REG_IRQ_ENABLE:
+        s->irq_enable = val;
+        break;
+    case GPGPU_REG_IRQ_ACK:
+        /* 写 1 清除对应中断状态位 */
+        s->irq_status &= ~val;
+        break;
     case GPGPU_REG_KERNEL_ADDR_LO:
         s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xFFFFFFFF00000000ULL) | (val & 0xFFFFFFFF);
         break;
@@ -82,6 +104,24 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
     case GPGPU_REG_BLOCK_DIM_X: s->kernel.block_dim[0] = val; break;
     case GPGPU_REG_BLOCK_DIM_Y: s->kernel.block_dim[1] = val; break;
     case GPGPU_REG_BLOCK_DIM_Z: s->kernel.block_dim[2] = val; break;
+    case GPGPU_REG_DMA_SRC_LO:
+        s->dma.src_addr = (s->dma.src_addr & 0xFFFFFFFF00000000ULL) | (val & 0xFFFFFFFF);
+        break;
+    case GPGPU_REG_DMA_SRC_HI:
+        s->dma.src_addr = (s->dma.src_addr & 0xFFFFFFFF) | (val << 32);
+        break;
+    case GPGPU_REG_DMA_DST_LO:
+        s->dma.dst_addr = (s->dma.dst_addr & 0xFFFFFFFF00000000ULL) | (val & 0xFFFFFFFF);
+        break;
+    case GPGPU_REG_DMA_DST_HI:
+        s->dma.dst_addr = (s->dma.dst_addr & 0xFFFFFFFF) | (val << 32);
+        break;
+    case GPGPU_REG_DMA_SIZE:
+        s->dma.size = val;
+        break;
+    case GPGPU_REG_DMA_CTRL:
+        s->dma.ctrl = val;
+        break;
     default:
         break;
     }
