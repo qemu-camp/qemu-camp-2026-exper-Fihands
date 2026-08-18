@@ -33,6 +33,16 @@ static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
     case GPGPU_REG_VRAM_SIZE_HI: return (uint32_t)(s->vram_size >> 32);
     case GPGPU_REG_GLOBAL_CTRL:  return s->global_ctrl;
     case GPGPU_REG_GLOBAL_STATUS: return s->global_status;
+    case GPGPU_REG_KERNEL_ADDR_LO:  return (uint32_t)s->kernel.kernel_addr;
+    case GPGPU_REG_KERNEL_ADDR_HI:  return (uint32_t)(s->kernel.kernel_addr >> 32);
+    case GPGPU_REG_KERNEL_ARGS_LO:  return (uint32_t)s->kernel.kernel_args;
+    case GPGPU_REG_KERNEL_ARGS_HI:  return (uint32_t)(s->kernel.kernel_args >> 32);
+    case GPGPU_REG_GRID_DIM_X:   return s->kernel.grid_dim[0];
+    case GPGPU_REG_GRID_DIM_Y:   return s->kernel.grid_dim[1];
+    case GPGPU_REG_GRID_DIM_Z:   return s->kernel.grid_dim[2];
+    case GPGPU_REG_BLOCK_DIM_X:  return s->kernel.block_dim[0];
+    case GPGPU_REG_BLOCK_DIM_Y:  return s->kernel.block_dim[1];
+    case GPGPU_REG_BLOCK_DIM_Z:  return s->kernel.block_dim[2];
     default:                     return 0;
     }
     (void)size;
@@ -54,6 +64,24 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
             s->global_ctrl &= ~GPGPU_CTRL_RESET;
         }
         break;
+    case GPGPU_REG_KERNEL_ADDR_LO:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xFFFFFFFF00000000ULL) | (val & 0xFFFFFFFF);
+        break;
+    case GPGPU_REG_KERNEL_ADDR_HI:
+        s->kernel.kernel_addr = (s->kernel.kernel_addr & 0xFFFFFFFF) | (val << 32);
+        break;
+    case GPGPU_REG_KERNEL_ARGS_LO:
+        s->kernel.kernel_args = (s->kernel.kernel_args & 0xFFFFFFFF00000000ULL) | (val & 0xFFFFFFFF);
+        break;
+    case GPGPU_REG_KERNEL_ARGS_HI:
+        s->kernel.kernel_args = (s->kernel.kernel_args & 0xFFFFFFFF) | (val << 32);
+        break;
+    case GPGPU_REG_GRID_DIM_X:  s->kernel.grid_dim[0] = val; break;
+    case GPGPU_REG_GRID_DIM_Y:  s->kernel.grid_dim[1] = val; break;
+    case GPGPU_REG_GRID_DIM_Z:  s->kernel.grid_dim[2] = val; break;
+    case GPGPU_REG_BLOCK_DIM_X: s->kernel.block_dim[0] = val; break;
+    case GPGPU_REG_BLOCK_DIM_Y: s->kernel.block_dim[1] = val; break;
+    case GPGPU_REG_BLOCK_DIM_Z: s->kernel.block_dim[2] = val; break;
     default:
         break;
     }
