@@ -98,23 +98,64 @@ static const MemoryRegionOps gpgpu_ctrl_ops = {
     },
 };
 
-/* TODO: Implement VRAM read */
 static uint64_t gpgpu_vram_read(void *opaque, hwaddr addr, unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)size;
-    return 0;
+    GPGPUState *s = opaque;
+    uint64_t val = 0;
+
+    if (addr + size > s->vram_size) {
+        qemu_log_mask(LOG_GUEST_ERROR, "gpgpu: VRAM read out of bounds: "
+                      "addr=0x%" HWADDR_PRIx " size=%u\n", addr, size);
+        return 0;
+    }
+
+    switch (size) {
+    case 1:
+        val = ldub_p(s->vram_ptr + addr);
+        break;
+    case 2:
+        val = lduw_le_p(s->vram_ptr + addr);
+        break;
+    case 4:
+        val = ldl_le_p(s->vram_ptr + addr);
+        break;
+    case 8:
+        val = ldq_le_p(s->vram_ptr + addr);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    return val;
 }
 
-/* TODO: Implement VRAM write */
 static void gpgpu_vram_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
-    (void)size;
+    GPGPUState *s = opaque;
+
+    if (addr + size > s->vram_size) {
+        qemu_log_mask(LOG_GUEST_ERROR, "gpgpu: VRAM write out of bounds: "
+                      "addr=0x%" HWADDR_PRIx " size=%u\n", addr, size);
+        return;
+    }
+
+    switch (size) {
+    case 1:
+        stb_p(s->vram_ptr + addr, val);
+        break;
+    case 2:
+        stw_le_p(s->vram_ptr + addr, val);
+        break;
+    case 4:
+        stl_le_p(s->vram_ptr + addr, val);
+        break;
+    case 8:
+        stq_le_p(s->vram_ptr + addr, val);
+        break;
+    default:
+        g_assert_not_reached();
+    }
 }
 
 static const MemoryRegionOps gpgpu_vram_ops = {
