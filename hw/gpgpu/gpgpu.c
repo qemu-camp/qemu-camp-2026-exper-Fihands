@@ -22,6 +22,8 @@
 #include "gpgpu.h"
 #include "gpgpu_core.h"
 
+static void gpgpu_dispatch_kernel(GPGPUState *s);
+
 static uint64_t gpgpu_ctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     GPGPUState *s = opaque;
@@ -115,6 +117,10 @@ static void gpgpu_ctrl_write(void *opaque, hwaddr addr, uint64_t val,
     case GPGPU_REG_BLOCK_DIM_X: s->kernel.block_dim[0] = val; break;
     case GPGPU_REG_BLOCK_DIM_Y: s->kernel.block_dim[1] = val; break;
     case GPGPU_REG_BLOCK_DIM_Z: s->kernel.block_dim[2] = val; break;
+    case GPGPU_REG_DISPATCH:
+        /* 写任意值启动内核执行 */
+        gpgpu_dispatch_kernel(s);
+        break;
     case GPGPU_REG_DMA_SRC_LO:
         s->dma.src_addr = (s->dma.src_addr & 0xFFFFFFFF00000000ULL) | (val & 0xFFFFFFFF);
         break;
@@ -267,6 +273,42 @@ static void gpgpu_dma_complete(void *opaque)
 static void gpgpu_kernel_complete(void *opaque)
 {
     (void)opaque;
+}
+
+/*
+ * 内核分发: 写 DISPATCH 寄存器触发内核执行
+ * 执行模型为同步模拟: 写入后立即执行完毕
+ */
+static void gpgpu_dispatch_kernel(GPGPUState *s)
+{
+    int ret;
+
+    /* 设备未使能时拒绝分发 */
+    if (!(s->global_ctrl & GPGPU_CTRL_ENABLE)) {
+        s->error_status |= GPGPU_ERR_INVALID_CMD;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        return;
+    }
+
+    s->global_status |= GPGPU_STATUS_BUSY;
+    ret = gpgpu_core_exec_kernel(s);
+    s->global_status &= ~GPGPU_STATUS_BUSY;
+
+    if (ret == 0) {
+        s->irq_status |= GPGPU_IRQ_KERNEL_DONE;
+        if ((s->irq_enable & GPGPU_IRQ_KERNEL_DONE) &&
+            msix_enabled(PCI_DEVICE(s))) {
+            msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_KERNEL);
+        }
+    } else {
+        s->error_status |= GPGPU_ERR_KERNEL_FAULT;
+        s->global_status |= GPGPU_STATUS_ERROR;
+        s->irq_status |= GPGPU_IRQ_ERROR;
+        if ((s->irq_enable & GPGPU_IRQ_ERROR) &&
+            msix_enabled(PCI_DEVICE(s))) {
+            msix_notify(PCI_DEVICE(s), GPGPU_MSIX_VEC_ERROR);
+        }
+    }
 }
 
 static void gpgpu_realize(PCIDevice *pdev, Error **errp)
