@@ -71,6 +71,14 @@ static inline int32_t rv_imm_j(uint32_t inst)
 /* 浮点符号位 */
 #define FP32_SIGN_BIT       0x80000000u
 
+/* 低精度浮点扩展 funct7 (自定义，位于 OP-FP 编码空间) */
+#define FUNCT7_FCVT_BF16    0x22    /* BF16 转换 */
+#define FUNCT7_FCVT_FP8     0x24    /* FP8 E4M3/E5M2 转换 */
+#define FUNCT7_FCVT_FP4     0x26    /* FP4 E2M1 转换 */
+
+/* FP32 位模式: 指数全 1 */
+#define FP32_EXP_ALL_ONES   0x7F800000u
+
 /* ============================================================================
  * RV32F 浮点辅助
  * ============================================================================
@@ -149,6 +157,50 @@ static uint32_t gpgpu_fclass32(uint32_t f)
         return sign ? 1u << 2 : 1u << 5;                  /* ±subnormal */
     }
     return sign ? 1u << 1 : 1u << 6;                      /* ±normal */
+}
+
+/*
+ * float32_to_float4_e2m1 - FP32 -> FP4 E2M1 手写转换 (RNE 舍入 + 饱和)
+ *
+ * E2M1 (sign 1 + exp 2, bias 1 + mant 1) 可表示的正数值:
+ *   000=0  001=0.5  010=1  011=1.5  100=2  101=3  110=4  111=6
+ * E2M1 无 Inf/NaN 表示，NaN 与 Inf 输入饱和到 ±6.0，
+ * 超出 ±6.0 的有限值同样饱和到 ±6.0。
+ *
+ * 正数 FP32 位模式单调，故可直接用位模式阈值判断落点。
+ * 区间中点为 0.25 / 0.75 / 1.25 / 1.75 / 2.5 / 3.5 / 5.0。
+ * 按 RNE 规则: 偶数-奇数边界的中点向下取偶，
+ * 奇数-偶数边界的中点向上取偶。
+ */
+static uint32_t float32_to_float4_e2m1(uint32_t f)
+{
+    uint32_t sign = f & FP32_SIGN_BIT;
+    uint32_t abs_bits = f & ~FP32_SIGN_BIT;
+    uint32_t exp = (f >> 23) & 0xFF;
+    uint32_t code;
+
+    if (exp == 0xFF) {
+        /* NaN / Inf: 饱和到 ±6.0 */
+        code = 0x7;
+    } else if (abs_bits <= 0x3E800000u) {       /* <= 0.25 (tie->0)   : 0   */
+        code = 0x0;
+    } else if (abs_bits < 0x3F400000u) {        /* (0.25, 0.75)       : 0.5 */
+        code = 0x1;
+    } else if (abs_bits <= 0x3FA00000u) {       /* [0.75,1.25 tie->1.0]: 1.0 */
+        code = 0x2;
+    } else if (abs_bits < 0x3FE00000u) {        /* (1.25, 1.75)       : 1.5 */
+        code = 0x3;
+    } else if (abs_bits <= 0x40200000u) {       /* [1.75(tie),2.5(tie)]: 2.0 */
+        code = 0x4;
+    } else if (abs_bits < 0x40600000u) {        /* (2.5, 3.5)         : 3.0 */
+        code = 0x5;
+    } else if (abs_bits <= 0x40A00000u) {       /* [3.5(tie),5.0(tie)]: 4.0 */
+        code = 0x6;
+    } else {                                    /* > 5.0              : 6.0 */
+        code = 0x7;
+    }
+
+    return sign | code;
 }
 
 /* ============================================================================
@@ -789,6 +841,83 @@ static int gpgpu_exec_insn(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_idx,
                 return -1;
             }
             WRITE_FRD(v1);
+            break;
+
+        case FUNCT7_FCVT_BF16:  /* BF16 转换: sign(1)+exp(8)+mant(7) */
+            switch (rs2) {
+            case 0:     /* FCVT.S.BF16: BF16(低 16 位) -> FP32 */
+                res = bfloat16_to_float32(fs1 & 0xFFFFu, &lane->fp_status);
+                WRITE_FRD(res);
+                gpgpu_fp_sync_flags(lane);
+                break;
+
+            case 1:     /* FCVT.BF16.S: FP32 -> BF16 (存低 16 位) */
+                WRITE_FRD(float32_to_bfloat16(fs1, &lane->fp_status));
+                gpgpu_fp_sync_flags(lane);
+                break;
+
+            default:
+                return -1;
+            }
+            break;
+
+        case FUNCT7_FCVT_FP8:   /* FP8 转换: E4M3/E5M2 */
+            switch (rs2) {
+            case 0:     /* FCVT.S.E4M3: E4M3 -> BF16 -> FP32 */
+            {
+                bfloat16 bf = float8_e4m3_to_bfloat16(fs1 & 0xFFu,
+                                                      &lane->fp_status);
+                res = bfloat16_to_float32(bf, &lane->fp_status);
+                WRITE_FRD(res);
+                gpgpu_fp_sync_flags(lane);
+                break;
+            }
+
+            case 1:     /* FCVT.E4M3.S: FP32 -> E4M3 (饱和到 ±448) */
+                WRITE_FRD(float32_to_float8_e4m3(fs1, true, &lane->fp_status));
+                gpgpu_fp_sync_flags(lane);
+                break;
+
+            case 2:     /* FCVT.S.E5M2: E5M2 -> BF16 -> FP32 */
+            {
+                bfloat16 bf = float8_e5m2_to_bfloat16(fs1 & 0xFFu,
+                                                      &lane->fp_status);
+                res = bfloat16_to_float32(bf, &lane->fp_status);
+                WRITE_FRD(res);
+                gpgpu_fp_sync_flags(lane);
+                break;
+            }
+
+            case 3:     /* FCVT.E5M2.S: FP32 -> E5M2 (饱和, Inf 保持) */
+                WRITE_FRD(float32_to_float8_e5m2(fs1, true, &lane->fp_status));
+                gpgpu_fp_sync_flags(lane);
+                break;
+
+            default:
+                return -1;
+            }
+            break;
+
+        case FUNCT7_FCVT_FP4:   /* FP4 E2M1 转换 (4 bit, 饱和到 ±6.0) */
+            switch (rs2) {
+            case 0:     /* FCVT.S.E2M1: E2M1 -> E4M3 -> BF16 -> FP32 */
+            {
+                float8_e4m3 e4 = float4_e2m1_to_float8_e4m3(fs1 & 0xFu,
+                                                            &lane->fp_status);
+                bfloat16 bf = float8_e4m3_to_bfloat16(e4, &lane->fp_status);
+                res = bfloat16_to_float32(bf, &lane->fp_status);
+                WRITE_FRD(res);
+                gpgpu_fp_sync_flags(lane);
+                break;
+            }
+
+            case 1:     /* FCVT.E2M1.S: FP32 -> E2M1 (阈值舍入 + 饱和) */
+                WRITE_FRD(float32_to_float4_e2m1(fs1));
+                break;
+
+            default:
+                return -1;
+            }
             break;
 
         default:
