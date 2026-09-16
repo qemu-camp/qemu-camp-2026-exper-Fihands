@@ -5,7 +5,8 @@
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  *
- * 简化的 RV32IM 指令解释器 + Zicsr (mhartid)，用于 GPU 核心模拟。
+ * 简化的 RV32IM + RV32F 指令解释器 + Zicsr (mhartid/fflags/frm/fcsr)，
+ * 用于 GPU 核心模拟。
  * 执行模型: 每个 warp 包含 32 个 lane，锁步执行同一条指令。
  * 线程通过 ebreak 结束执行；所有 lane 结束后 warp 完成。
  */
@@ -64,6 +65,92 @@ static inline int32_t rv_imm_j(uint32_t inst)
     return imm;
 }
 
+/* rs3 字段提取 (FMADD 系) */
+#define RV_RS3(inst)        (((inst) >> 27) & 0x1F)
+
+/* 浮点符号位 */
+#define FP32_SIGN_BIT       0x80000000u
+
+/* ============================================================================
+ * RV32F 浮点辅助
+ * ============================================================================
+ */
+
+/*
+ * gpgpu_fp_set_rm - 校验 RISC-V rm 字段并设置 softfloat 舍入模式
+ * rm: 0=RNE 1=RTZ 2=RDN 3=RUP 4=RMM 7=DYN(取 fcsr.frm)
+ * 返回: 0 成功，-1 非法 rm (如 DYN 时 frm 为保留值)
+ */
+static int gpgpu_fp_set_rm(GPGPULane *lane, uint32_t rm, FloatRoundMode *out)
+{
+    if (rm == 7) {  /* DYN: 使用 fcsr.frm */
+        rm = (lane->fcsr >> 5) & 0x7;
+    }
+
+    switch (rm) {
+    case 0:  /* RNE */
+        *out = float_round_nearest_even;
+        break;
+    case 1:  /* RTZ */
+        *out = float_round_to_zero;
+        break;
+    case 2:  /* RDN */
+        *out = float_round_down;
+        break;
+    case 3:  /* RUP */
+        *out = float_round_up;
+        break;
+    case 4:  /* RMM: round to nearest, ties away from zero */
+        *out = float_round_ties_away;
+        break;
+    default:
+        return -1;
+    }
+
+    set_float_rounding_mode(*out, &lane->fp_status);
+    return 0;
+}
+
+/*
+ * gpgpu_fp_sync_flags - 把 softfloat 异常标志合并进 lane 的 fflags
+ * RISC-V fflags 位序 NX|UF|OF|DZ|NV 与 softfloat 低 5 位一致
+ */
+static void gpgpu_fp_sync_flags(GPGPULane *lane)
+{
+    int flags = get_float_exception_flags(&lane->fp_status);
+
+    if (flags) {
+        lane->fcsr = (lane->fcsr & ~0x1Fu) | (uint32_t)(flags & 0x1F);
+        set_float_exception_flags(0, &lane->fp_status);
+    }
+}
+
+/*
+ * gpgpu_fclass32 - FCLASS.S: 按 RISC-V 分类位序生成类别掩码
+ * bit0:-Inf bit1:-normal bit2:-subnormal bit3:-0 bit4:+0
+ * bit5:+subnormal bit6:+normal bit7:+Inf bit8:sNaN bit9:qNaN
+ */
+static uint32_t gpgpu_fclass32(uint32_t f)
+{
+    bool sign = (f >> 31) != 0;
+    uint32_t exp = (f >> 23) & 0xFF;
+    uint32_t frac = f & 0x7FFFFF;
+
+    if (exp == 0xFF) {
+        if (frac == 0) {
+            return sign ? 1u << 0 : 1u << 7;              /* ±Inf */
+        }
+        return (frac & 0x400000) ? 1u << 9 : 1u << 8;     /* qNaN / sNaN */
+    }
+    if (exp == 0) {
+        if (frac == 0) {
+            return sign ? 1u << 3 : 1u << 4;              /* ±0 */
+        }
+        return sign ? 1u << 2 : 1u << 5;                  /* ±subnormal */
+    }
+    return sign ? 1u << 1 : 1u << 6;                      /* ±normal */
+}
+
 /* ============================================================================
  * Warp 初始化
  * ============================================================================
@@ -95,6 +182,14 @@ void gpgpu_core_init_warp(GPGPUWarp *warp, uint32_t pc,
         /* mhartid 位域: [block(19) | warp(8) | tid(5)] */
         lane->mhartid = MHARTID_ENCODE(block_id_linear, warp_id,
                                        thread_id_base + i);
+
+        /* 浮点执行环境: 默认 RNE 舍入 + canonical NaN 模式 */
+        set_float_rounding_mode(float_round_nearest_even, &lane->fp_status);
+        set_float_exception_flags(0, &lane->fp_status);
+        set_default_nan_mode(1, &lane->fp_status);
+        /* canonical NaN: 符号位 0, frac 最高位 1 */
+        set_float_default_nan_pattern(0b01000000, &lane->fp_status);
+        set_snan_bit_is_one(0, &lane->fp_status);
     }
 }
 
@@ -236,6 +331,11 @@ static int gpgpu_exec_insn(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_idx,
         } \
     } while (0)
 
+    /* 写浮点结果 (f0 可写，与 x0 不同) */
+    #define WRITE_FRD(v) do { \
+        lane->fpr[rd] = (v); \
+    } while (0)
+
     switch (opcode) {
     case 0x37:  /* LUI */
         WRITE_RD(rv_imm_u(inst));
@@ -327,6 +427,30 @@ static int gpgpu_exec_insn(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_idx,
             return -1;
         }
         if (ret) { return -1; }
+        break;
+
+    case 0x27:  /* STORE-FP */
+        switch (funct3) {
+        case 2:  /* FSW */
+            ret = gpgpu_lane_store(s, v1 + rv_imm_s(inst), 4, lane->fpr[rs2]);
+            break;
+        default:
+            return -1;
+        }
+        if (ret) { return -1; }
+        break;
+
+    case 0x07:  /* LOAD-FP */
+        switch (funct3) {
+        case 2:  /* FLW */
+            ret = gpgpu_lane_load(s, warp, lane_idx, v1 + rv_imm_i(inst),
+                                  4, &val);
+            if (ret) { return -1; }
+            WRITE_FRD(val);
+            break;
+        default:
+            return -1;
+        }
         break;
 
     case 0x13:  /* OP-IMM */
@@ -460,6 +584,219 @@ static int gpgpu_exec_insn(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_idx,
         }
         break;
 
+    case 0x43:  /* FMADD.S */
+    case 0x47:  /* FMSUB.S */
+    case 0x4B:  /* FNMSUB.S */
+    case 0x4F:  /* FNMADD.S */
+    {
+        uint32_t rs3 = RV_RS3(inst);
+        FloatRoundMode rm;
+        int mflags;
+        float32 res;
+
+        if (funct3 != 0) {  /* RV32F 仅支持 fmt = S */
+            return -1;
+        }
+        if (gpgpu_fp_set_rm(lane, (inst >> 17) & 0x7, &rm)) {
+            return -1;
+        }
+
+        /* softfloat 语义: round(rs1 * rs2 + rs3) */
+        switch (opcode) {
+        case 0x43:  /* fmadd */
+            mflags = 0;
+            break;
+        case 0x47:  /* fmsub: rs1*rs2 - rs3 */
+            mflags = float_muladd_negate_c;
+            break;
+        case 0x4B:  /* fnmsub: -(rs1*rs2) + rs3 */
+            mflags = float_muladd_negate_product;
+            break;
+        case 0x4F:  /* fnmadd: -(rs1*rs2 + rs3) */
+            mflags = float_muladd_negate_result;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+
+        res = float32_muladd(lane->fpr[rs1], lane->fpr[rs2], lane->fpr[rs3],
+                             mflags, &lane->fp_status);
+        WRITE_FRD(res);
+        gpgpu_fp_sync_flags(lane);
+        break;
+    }
+
+    case 0x53:  /* OP-FP: RV32F 单精度浮点 */
+    {
+        uint32_t fs1 = lane->fpr[rs1];
+        uint32_t fs2 = lane->fpr[rs2];
+        FloatRoundMode rm;
+        float32 res;
+        uint32_t ires;
+
+        /* rm 字段校验并设置舍入模式 (FSQRT/FCVT 的 rm 与其余指令的 fmt 复用 funct3) */
+        if (gpgpu_fp_set_rm(lane, funct3, &rm)) {
+            return -1;
+        }
+
+        switch (funct7) {
+        case 0x00:  /* FADD.S */
+            res = float32_add(fs1, fs2, &lane->fp_status);
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x04:  /* FSUB.S */
+            res = float32_sub(fs1, fs2, &lane->fp_status);
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x08:  /* FMUL.S */
+            res = float32_mul(fs1, fs2, &lane->fp_status);
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x0C:  /* FDIV.S */
+            res = float32_div(fs1, fs2, &lane->fp_status);
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x2C:  /* FSQRT.S */
+            if (rs2 != 0) {
+                return -1;
+            }
+            res = float32_sqrt(fs1, &lane->fp_status);
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x10:  /* FSGNJ.S / FSGNJN.S / FSGNJX.S */
+            if (funct3 != 0) {
+                return -1;
+            }
+            switch (rs2) {
+            case 0:     /* FSGNJ: 注入 fs2 的符号位 */
+                res = (fs1 & ~FP32_SIGN_BIT) | (fs2 & FP32_SIGN_BIT);
+                break;
+            case 1:     /* FSGNJN: 注入 fs2 符号的相反值 */
+                res = (fs1 & ~FP32_SIGN_BIT) | (~fs2 & FP32_SIGN_BIT);
+                break;
+            case 2:     /* FSGNJX: 符号位异或 */
+                res = fs1 ^ (fs2 & FP32_SIGN_BIT);
+                break;
+            default:
+                return -1;
+            }
+            WRITE_FRD(res);
+            break;
+
+        case 0x14:  /* FMIN.S / FMAX.S */
+            if (funct3 != 0) {
+                return -1;
+            }
+            switch (rs2) {
+            case 0:     /* FMIN.S */
+                res = float32_minnum(fs1, fs2, &lane->fp_status);
+                break;
+            case 1:     /* FMAX.S */
+                res = float32_maxnum(fs1, fs2, &lane->fp_status);
+                break;
+            default:
+                return -1;
+            }
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x50:  /* FLE.S / FLT.S / FEQ.S */
+            if (funct3 != 0) {
+                return -1;
+            }
+            switch (rs2) {
+            case 0:     /* FLE.S: 任一 NaN 触发 invalid */
+                ires = float32_le(fs1, fs2, &lane->fp_status);
+                break;
+            case 1:     /* FLT.S */
+                ires = float32_lt(fs1, fs2, &lane->fp_status);
+                break;
+            case 2:     /* FEQ.S: 仅 sNaN 触发 invalid */
+                ires = float32_eq_quiet(fs1, fs2, &lane->fp_status);
+                break;
+            default:
+                return -1;
+            }
+            WRITE_RD(ires);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x60:  /* FCVT.W.S: f32 -> 有符号整数 */
+            if (rs2 != 0) {
+                return -1;
+            }
+            /* softfloat: NaN -> INT32_MAX, 溢出按符号饱和并置 invalid */
+            ires = (uint32_t)float32_to_int32(fs1, &lane->fp_status);
+            WRITE_RD(ires);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x61:  /* FCVT.WU.S: f32 -> 无符号整数 */
+            if (rs2 != 0) {
+                return -1;
+            }
+            WRITE_RD(float32_to_uint32(fs1, &lane->fp_status));
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x68:  /* FCVT.S.W: 有符号整数 -> f32 */
+            if (rs2 != 0) {
+                return -1;
+            }
+            res = int32_to_float32((int32_t)v1, &lane->fp_status);
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x69:  /* FCVT.S.WU: 无符号整数 -> f32 */
+            if (rs2 != 0) {
+                return -1;
+            }
+            res = uint32_to_float32(v1, &lane->fp_status);
+            WRITE_FRD(res);
+            gpgpu_fp_sync_flags(lane);
+            break;
+
+        case 0x70:  /* FMV.X.W / FCLASS.S */
+            if (rs2 != 0) {
+                return -1;
+            }
+            switch (funct3) {
+            case 0:     /* FMV.X.W: 位透传 */
+                WRITE_RD(fs1);
+                break;
+            case 1:     /* FCLASS.S */
+                WRITE_RD(gpgpu_fclass32(fs1));
+                break;
+            default:
+                return -1;
+            }
+            break;
+
+        case 0x78:  /* FMV.W.X: 位透传 */
+            if (funct3 != 0 || rs2 != 0) {
+                return -1;
+            }
+            WRITE_FRD(v1);
+            break;
+
+        default:
+            return -1;
+        }
+        break;
+    }
+
     case 0x0F:  /* FENCE */
         break;
 
@@ -475,14 +812,72 @@ static int gpgpu_exec_insn(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_idx,
         }
         if (funct3 != 0) {                 /* CSR 指令 */
             uint32_t csr = inst >> 20;
+            uint32_t src = (funct3 >= 5) ? rs1 : v1;  /* CSRRW*I 的 src 为 zimm */
             uint32_t old = 0;
+            uint32_t new_val = 0;
+            bool wok;    /* 是否为可写 CSR */
+            bool w;
 
-            /* 目前只支持 mhartid (只读) */
-            if (csr == CSR_MHARTID) {
+            /* 读取旧值，确定可写性 */
+            switch (csr) {
+            case CSR_MHARTID:  /* 只读 */
                 old = lane->mhartid;
+                wok = false;
+                break;
+            case CSR_FFLAGS:
+                old = lane->fcsr & 0x1F;
+                wok = true;
+                break;
+            case CSR_FRM:
+                old = (lane->fcsr >> 5) & 0x7;
+                wok = true;
+                break;
+            case CSR_FCSR:
+                old = lane->fcsr & 0xFF;
+                wok = true;
+                break;
+            default:
+                old = 0;
+                wok = false;
+                break;
             }
+
+            /* 计算 CSR 写入值 (funct3 低 2 位: 1=CSRRW 2=CSRRS 3=CSRRC) */
+            switch (funct3 & 0x3) {
+            case 1:  /* CSRRW(I): 无条件写 */
+                w = true;
+                new_val = src;
+                break;
+            case 2:  /* CSRRS(I): src 非 0 才写 */
+                w = (src != 0);
+                new_val = old | src;
+                break;
+            case 3:  /* CSRRC(I) */
+                w = (src != 0);
+                new_val = old & ~src;
+                break;
+            default:
+                return -1;  /* funct3=4 非法 */
+            }
+
+            if (wok && w) {
+                switch (csr) {
+                case CSR_FFLAGS:
+                    lane->fcsr = (lane->fcsr & ~0x1Fu) | (new_val & 0x1Fu);
+                    break;
+                case CSR_FRM:
+                    lane->fcsr = (lane->fcsr & ~0xE0u) |
+                                 ((new_val & 0x7u) << 5);
+                    break;
+                case CSR_FCSR:
+                    lane->fcsr = new_val & 0xFFu;
+                    break;
+                default:
+                    break;
+                }
+            }
+
             WRITE_RD(old);
-            /* 只读 CSR，忽略写操作 (csrrw/csrrs/csrrc) */
         }
         break;
 
@@ -491,6 +886,7 @@ static int gpgpu_exec_insn(GPGPUState *s, GPGPUWarp *warp, uint32_t lane_idx,
     }
 
     #undef WRITE_RD
+    #undef WRITE_FRD
 
     lane->pc = next_pc;
     return 0;
